@@ -1,0 +1,658 @@
+﻿@page "/autogestion"
+@using System.Globalization
+@using System.Net.Http
+@using System.Text
+@using System.Text.Json
+@using System.Text.RegularExpressions
+@using FormularioBlazor.Entities
+@inject NavigationManager Nav
+@inject HttpClient Http
+
+<style>
+    @_dynamicCss
+</style>
+
+<div class="container-fluid">
+    <h3 class="mb-3">Registro de solicitudes de licencias</h3>
+
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <span class="status-legend small">
+            <span class="status-chip">
+                <span class="swatch sw-approve"></span> Aprobada
+            </span>
+            <span class="status-chip">
+                <span class="swatch sw-pending"></span> Pendiente
+            </span>
+            <span class="status-chip">
+                <span class="swatch sw-rejected"></span> Rechazada
+            </span>
+        </span>
+
+        <div class="d-flex align-items-center gap-2">
+            <i class="bi bi-arrow-left-circle fs-4 text-secondary" @onclick="PreviousMonth"></i>
+
+            <select class="form-select form-select-sm fs-4 border-0" style="width: 165px;" @bind="month" @bind:after="OnMonthYearChanged">
+                @for (int m = 1; m <= 12; m++)
+                {
+                    <option value="@m">@CultureInfo.CurrentCulture.DateTimeFormat.GetMonthName(m)</option>
+                }
+            </select>
+
+            <i class="bi bi-arrow-right-circle fs-4 text-secondary " @onclick="NextMonth"></i>
+        </div>
+
+        <div class="d-flex align-items-center gap-2">
+            <label class="form-label m-0 small">Año:</label>
+            <input class="form-control form-control-sm" style="width: 80px;" type="number" @bind="year" @bind:after="OnMonthYearChanged" />
+        </div>
+    </div>
+
+    <div class="row mb-3">
+        <div class="col-12">
+            <div class="d-flex flex-wrap align-items-center gap-3">
+                <!-- Finde de semanas -->
+                <div class="form-check me-2">
+                    <input class="form-check-input" type="checkbox" id="chkFinde" @bind="ShowWeekends" />
+                    <label class="form-check-label" for="chkFinde">Fin de semanas</label>
+                </div>
+
+                <!-- Feriados -->
+                <div class="form-check me-3">
+                    <input class="form-check-input" type="checkbox" id="chkFeriados" @bind="ShowHolidays" />
+                    <label class="form-check-label" for="chkFeriados">Feriados</label>
+                </div>
+
+                <!-- Licencias -->
+                @{
+                    var tiposMes = (TiposOrdenados ?? Enumerable.Empty<TipoVm>()).ToList();
+                }
+
+                @if (tiposMes.Any())
+                {
+                    <div class="d-flex flex-wrap align-items-center gap-2">
+                        <label class="form-label m-0">Licencias</label>
+
+                        @foreach (var t in tiposMes)
+                        {
+                            <div class="form-check form-check-inline">
+                                <input class="form-check-input"
+                                       type="checkbox"
+                                       id="tipo_@t.Code"
+                                       checked="@IsTipoActivo(t.Code)"
+                                       @onchange="(ChangeEventArgs e) => ToggleTipo(t.Code, e)" />
+                                <label class="form-check-label" for="tipo_@t.Code">
+                                    <span class="legend pill @t.Css">@t.Name</span>
+                                    <span class="text-muted small">(@t.Count)</span>
+                                </label>
+                            </div>
+                        }
+                    </div>
+                }
+
+            </div>
+        </div>
+    </div>
+
+    <!-- Tabla -->
+    <div class="table-responsive">
+        <table class="table table-bordered table-sm align-middle calendar">
+            <thead class="table-light">
+                <tr>
+                    <th class="sticky-col">Empleado</th>
+                    @foreach (var dt in VisibleDates)
+                    {
+                        <th class="text-center sticky-head">
+                            @DowLetterEs(dt.DayOfWeek)
+                        </th>
+                    }
+                </tr>
+            </thead>
+            <tbody>
+                @if (rows.Count == 0)
+                {
+                    var empty = new Dictionary<int, Cell>();
+                    <tr>
+                        <th class="sticky-col bg-white">(Sin empleado)</th>
+                        @foreach (var dt in VisibleDates)
+                        {
+                            var classes = CellClass(empty, dt.Day) + (IsToday(dt) ? " today" : "");
+                            var titleText = ShowHolidays ? HolidayTooltip(dt) : string.Empty;
+                            <td class="@classes" title="@titleText">
+                                <span class="daynum">@dt.Day</span>
+                            </td>
+                        }
+                    </tr>
+                }
+                else
+                {
+                    @foreach (var r in rows)
+                    {
+                        <tr>
+                            <th class="sticky-col bg-white">@r.Empleado</th>
+
+                            @foreach (var dt in VisibleDates)
+                            {
+                                var day = dt.Day;
+                                var info = r.Cells.TryGetValue(day, out var c) ? c : null;
+                                var classes = CellClass(r.Cells, day) + (IsToday(dt) ? " today" : "");
+                                var titleText = info is not null ? Tooltip(info) : (ShowHolidays ? HolidayTooltip(dt) : string.Empty);
+                                <td class="@classes" title="@titleText" @ondblclick="() => OnClickCell(r, day)">
+                                    <span class="daynum">@day</span>
+
+                                    @if (day == 1 && TieneLicenciaAnterior(r))
+                                    {
+                                        <div class="position-absolute navigation-arrow left-arrow">
+                                            <i class="bi bi-circle-fill text-black fs-5"></i>
+                                            <i class="bi bi-arrow-left text-white fs-5 position-absolute top-50 start-50 translate-middle"
+                                               style="cursor: pointer;"
+                                               @onclick="() => NavigateToEmployeeLicense(r, -1)"
+                                               title="Ver licencias del mes anterior"></i>
+                                        </div>
+                                    }
+
+                                    @if (day == DateTime.DaysInMonth(year, month) && TieneLicenciaSiguiente(r))
+                                    {
+                                        <div class="position-absolute navigation-arrow right-arrow">
+                                            <i class="bi bi-circle-fill text-black fs-5"></i>
+                                            <i class="bi bi-arrow-right text-white fs-5 position-absolute top-50 start-50 translate-middle"
+                                               style="cursor: pointer;"
+                                               @onclick="() => NavigateToEmployeeLicense(r, 1)"
+                                               title="Ver licencias del mes siguiente"></i>
+                                        </div>
+                                    }
+
+                                </td>
+                            }
+                        </tr>
+                    }
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+@code {
+    #region Constantes
+    private const string EstadoAprobada = "A";
+    private const string EstadoPendiente = "P";
+    private const string EstadoRechazada = "R";
+    #endregion
+
+    #region Propiedades y Variables
+    private bool ShowWeekends { get; set; } = true;
+    private bool ShowHolidays { get; set; } = true;
+    private int year = DateTime.Now.Year;
+    private int month = DateTime.Now.Month;
+    private List<Row> rows = new();
+    private DateOnly Start => new(year, month, 1);
+    private DateOnly End => new(year, month, DateTime.DaysInMonth(year, month));
+
+    private readonly HashSet<int> feriadosMMdd = new();
+    private readonly Dictionary<int, string> feriadoDescByMMdd = new();
+
+    [Parameter] public EventCallback<int> OnEditarSolicitud { get; set; }
+
+    private readonly Dictionary<string, bool> tiposActivos = new(StringComparer.OrdinalIgnoreCase);
+    #endregion
+
+    #region Propiedades Calculadas
+    private IEnumerable<DateOnly> VisibleDates
+    {
+        get
+        {
+            var d = Start;
+            while (d <= End)
+            {
+                var isWeekend = d.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday;
+                if (ShowWeekends || !isWeekend)
+                    yield return d;
+                d = d.AddDays(1);
+            }
+        }
+    }
+
+    private List<TipoVm> TiposOrdenados =>
+        ConteoPorTipoMes()
+            .OrderByDescending(kv => kv.Value)
+            .Select(kv => new TipoVm(kv.Key, NombreTipo(kv.Key), CssClassForTipo(kv.Key), kv.Value))
+            .ToList();
+    #endregion
+
+    #region Ciclo de Vida del Componente
+    protected override async Task OnInitializedAsync()
+    {
+        await LoadDataAsync(year, month);
+        ExpandRangesToCells();
+        RefreshTiposDisponiblesMes();
+    }
+    #endregion
+
+    #region Eventos y Navegación
+    private async Task OnMonthYearChanged()
+    {
+        await LoadDataAsync(year, month);
+        ExpandRangesToCells();
+        RefreshTiposDisponiblesMes();
+        StateHasChanged();
+    }
+
+    private async Task PreviousMonth()
+    {
+        if (month == 1)
+        {
+            month = 12;
+            year--;
+        }
+        else
+        {
+            month--;
+        }
+        await OnMonthYearChanged();
+    }
+
+    private async Task NextMonth()
+    {
+        if (month == 12)
+        {
+            month = 1;
+            year++;
+        }
+        else
+        {
+            month++;
+        }
+        await OnMonthYearChanged();
+    }
+
+    private async Task OnClickCell(Row row, int day)
+    {
+        if (!row.Cells.TryGetValue(day, out var cell)) return;
+        if (!IsTipoActivo(cell.Tipo)) return;
+
+        if (OnEditarSolicitud.HasDelegate)
+            await OnEditarSolicitud.InvokeAsync(Convert.ToInt32(cell.IdOcurrenciaPedido));
+        else
+            Nav.NavigateTo($"/solicitudes/editar/{cell.IdOcurrenciaPedido}");
+    }
+    #endregion
+
+    #region Carga de Datos
+    private async Task LoadDataAsync(int y, int m)
+    {
+        const string url = "https://raw.githubusercontent.com/NetCoderX/DatosPrueba/main/jsonLicenciasYFeriados.json";
+        const string urlSucesos = "https://raw.githubusercontent.com/NetCoderX/DatosPrueba/main/sucesos.json";
+
+        var json = await Http.GetStringAsync(url);
+        var empleadoslista = JsonSerializer.Deserialize<LicenciasPersonaACargo>(json,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            ?? new LicenciasPersonaACargo();
+
+        var jsonSucesos = await Http.GetStringAsync(urlSucesos);
+        var sucesos = JsonSerializer.Deserialize<List<Sucesos>>(jsonSucesos,
+                                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                             ?? new List<Sucesos>();
+
+        _mapDescToCod = sucesos
+            .GroupBy(s => Norm(s.Descripcion))
+            .ToDictionary(g => g.Key, g => g.First().CodSuceso, StringComparer.OrdinalIgnoreCase);
+
+        BuildDynamicCss(sucesos);
+
+        SetFeriadosFrom(empleadoslista, y, m);
+        rows = MapToRows(empleadoslista, y, m);
+    }
+    #endregion
+
+    #region Lógica de Expansión Día a Día
+    private void ExpandRangesToCells()
+    {
+        foreach (var r in rows)
+        {
+            r.Cells.Clear();
+            foreach (var range in r.Ranges)
+            {
+                var desde = Max(range.Desde, Start);
+                var hasta = Min(range.Hasta, End);
+                for (var d = desde; d <= hasta; d = d.AddDays(1))
+                {
+                    r.Cells[d.Day] = new Cell(range.Tipo, range.Estado, range.Desde, range.Hasta, range.IdOcurrenciaPedido);
+                }
+            }
+        }
+    }
+
+    private static DateOnly Max(DateOnly a, DateOnly b) => a > b ? a : b;
+    private static DateOnly Min(DateOnly a, DateOnly b) => a < b ? a : b;
+    #endregion
+
+    #region Filtros y Tipos de Licencia
+    private bool IsTipoActivo(string code) =>
+        tiposActivos.TryGetValue(code, out var on) ? on : true;
+
+    private void ToggleTipo(string code, ChangeEventArgs e)
+    {
+        var value = e.Value is bool b ? b : bool.Parse(e.Value?.ToString() ?? "false");
+        tiposActivos[code] = value;
+        StateHasChanged();
+    }
+
+    private void RefreshTiposDisponiblesMes()
+    {
+        var present = ConteoPorTipoMes().Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var code in present)
+            if (!tiposActivos.ContainsKey(code)) tiposActivos[code] = true;
+
+        var toRemove = tiposActivos.Keys.Where(k => !present.Contains(k)).ToList();
+        foreach (var k in toRemove) tiposActivos.Remove(k);
+    }
+
+    private Dictionary<string, int> ConteoPorTipoMes()
+    {
+        return rows
+            .SelectMany(r => r.Ranges)
+            .Where(rr => IntersectaMesActual(rr.Desde, rr.Hasta))
+            .GroupBy(rr => rr.Tipo, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.Count(), StringComparer.OrdinalIgnoreCase);
+    }
+    #endregion
+
+    #region Utilidades y Helpers
+    private bool EsFeriado(DateOnly d) => feriadosMMdd.Contains(d.Month * 100 + d.Day);
+
+    private static string DowLetterEs(DayOfWeek dow) => dow switch
+    {
+        DayOfWeek.Monday => "L",
+        DayOfWeek.Tuesday => "M",
+        DayOfWeek.Wednesday => "X", 
+        DayOfWeek.Thursday => "J",
+        DayOfWeek.Friday => "V",
+        DayOfWeek.Saturday => "S",
+        DayOfWeek.Sunday => "D",
+        _ => ""
+    };
+
+    private static bool IsToday(DateOnly d) => d == DateOnly.FromDateTime(DateTime.Today);
+
+    private bool IntersectaMesActual(DateOnly desde, DateOnly hasta)
+    {
+        var overlapStart = Max(desde, Start);
+        var overlapEnd = Min(hasta, End);
+        return overlapStart <= overlapEnd;
+    }
+    #endregion
+
+    #region Estilos y CSS
+    private string CellClass(Dictionary<int, Cell> cells, int day)
+    {
+        var classes = new List<string> { "p-0", "calendar-cell" };
+
+        var dt = new DateOnly(year, month, day);
+        if (ShowWeekends && dt.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+            classes.Add("wknd");
+
+        if (cells.TryGetValue(day, out var c))
+        {
+            if (IsTipoActivo(c.Tipo))
+            {
+                classes.Add(CssClassForTipo(c.Tipo));
+                if (c.Estado == EstadoAprobada) classes.Add("approved");
+                else if (c.Estado == EstadoPendiente) classes.Add("pending");
+                else if (c.Estado == EstadoRechazada) classes.Add("rejected");
+            }
+        }
+        else
+        {
+            if (ShowHolidays && EsFeriado(dt))
+                classes.Add("holiday");
+        }
+        return string.Join(' ', classes);
+    }
+
+    private string CssClassForTipo(string? tipo)
+    {
+        var key = tipo ?? string.Empty;
+        return _codeToCss.TryGetValue(key, out var css) ? css : "other";
+    }
+    #endregion
+
+    #region Mapeo y Transformación de Datos
+    private List<Row> MapToRows(LicenciasPersonaACargo data, int y, int m)
+    {
+        var start = new DateOnly(y, m, 1);
+        var end = new DateOnly(y, m, DateTime.DaysInMonth(y, m));
+
+        bool Intersecta(DateOnly d1, DateOnly d2) => d1 <= end && d2 >= start;
+
+        string MapTipoDinamico(string? descripcion)
+        {
+            if (string.IsNullOrWhiteSpace(descripcion)) return "OTR";
+            var key = Norm(descripcion);
+
+            if (_mapDescToCod.TryGetValue(key, out var cod)) return cod;
+
+            if (Regex.IsMatch(descripcion.Trim(), @"^[A-Z]{1,4}$"))
+                return descripcion.Trim();
+
+            return "OTR";
+        }
+
+        var items = (data?.LicenciasPersonaCargo ?? new List<List<LicPersonaACargo>>())
+            .SelectMany(list => list ?? Enumerable.Empty<LicPersonaACargo>())
+            .Where(e => e is not null && !string.IsNullOrWhiteSpace(e.Nombre))
+            .Where(e => Intersecta(DateOnly.FromDateTime(e.FechaDesde),
+                                   DateOnly.FromDateTime(e.FechaHasta)))
+            .DistinctBy(e => (
+                Id: (e.IdOcurrenciaPedido ?? "").Trim(),
+                Desde: e.FechaDesde.Date,
+                Hasta: e.FechaHasta.Date,
+                Tipo: e.TipoLicencia?.Trim(),
+                Est: e.Estado?.Trim()
+            ));
+
+        var dataEmpleado = items
+            .GroupBy(e => e.Nombre.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Select(g => new Row(
+                empleado: g.Key,
+                ranges: g
+                    .Select(e => new LeaveRange(
+                        DateOnly.FromDateTime(e.FechaDesde),
+                        DateOnly.FromDateTime(e.FechaHasta),
+                        MapTipoDinamico(e.TipoLicencia),
+                        MapTipoEstado(e.Estado),
+                        (e.IdOcurrenciaPedido ?? "").Trim()
+                    ))
+                    .DistinctBy(r => (r.IdOcurrenciaPedido, r.Desde, r.Hasta, r.Tipo, r.Estado))
+                    .OrderBy(r => r.IdOcurrenciaPedido)
+                    .ToList()
+            ))
+            .OrderBy(r => r.Empleado)
+            .ToList();
+
+        return dataEmpleado;
+    }
+
+    private void SetFeriadosFrom(LicenciasPersonaACargo root, int y, int m)
+    {
+        feriadosMMdd.Clear();
+        feriadoDescByMMdd.Clear();
+
+        var start = new DateOnly(y, m, 1);
+        var end = new DateOnly(y, m, DateTime.DaysInMonth(y, m));
+
+        var feriadosMes = (root?.LicenciasPersonaCargoFeriados ?? new List<LicPersonaACargoFeriados>())
+            .Where(f => f is not null)
+            .Select(f => new
+            {
+                Fecha = DateOnly.FromDateTime(f.Fecha),
+                Descripcion = f.Descripcion
+            })
+            .Where(f => f.Fecha >= start && f.Fecha <= end);
+
+        foreach (var f in feriadosMes)
+        {
+            var key = f.Fecha.Month * 100 + f.Fecha.Day;
+            feriadosMMdd.Add(key);
+
+            var desc = (f.Descripcion ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(desc)) desc = "Feriado";
+
+            if (feriadoDescByMMdd.TryGetValue(key, out var prev))
+                feriadoDescByMMdd[key] = string.Join(" / ", new[] { prev, desc }.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct());
+            else
+                feriadoDescByMMdd[key] = desc;
+        }
+    }
+
+    private static string MapTipoEstado(string estado) => estado switch
+    {
+        "Autorizada" => EstadoAprobada,
+        "Pendiente"  => EstadoPendiente,
+        "Rechazada"  => EstadoRechazada,
+        _            => EstadoPendiente 
+    };
+
+    private IReadOnlyDictionary<string, string> _mapDescToCod =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+    private static string Norm(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        s = s.Trim().Replace(".", " ");
+        var norm = s.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(norm.Length);
+        foreach (var ch in norm)
+            if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(ch)
+                != System.Globalization.UnicodeCategory.NonSpacingMark)
+                sb.Append(ch);
+        return sb.ToString().Normalize(NormalizationForm.FormC).ToLowerInvariant();
+    }
+    #endregion
+
+    #region Presentación y Tooltips
+    private string HolidayTooltip(DateOnly d)
+    {
+        var key = d.Month * 100 + d.Day;
+        return feriadoDescByMMdd.TryGetValue(key, out var desc) && !string.IsNullOrWhiteSpace(desc) ? $"Feriado: {desc}" : string.Empty;
+    }
+
+    private string Tooltip(Cell c) =>
+        $"{NombreTipo(c.Tipo)} ({EstadoText(c.Estado)}) - {c.FechaDesde:dd/MM} a {c.FechaHasta:dd/MM}";
+
+    private static string EstadoText(string e) => e switch
+    {
+        EstadoAprobada => "Aprobada",
+        EstadoPendiente => "Pendiente",
+        EstadoRechazada => "Rechazada",
+        _ => "N/A"
+    };
+
+    private string NombreTipo(string? tipo)
+    {
+        var key = tipo ?? string.Empty;
+        return _codeToName.TryGetValue(key, out var n) ? n : (tipo ?? "Otro");
+    }
+    #endregion
+
+    #region DTOs y Modelos
+    private sealed class Row
+    {
+        public string Empleado { get; }
+        public List<LeaveRange> Ranges { get; }
+        public Dictionary<int, Cell> Cells { get; } = new();
+
+        public Row(string empleado, List<LeaveRange> ranges)
+        {
+            Empleado = empleado;
+            Ranges = ranges;
+        }
+    }
+
+    private record LeaveRange(DateOnly Desde, DateOnly Hasta, string Tipo, string Estado, string IdOcurrenciaPedido);
+    private sealed record Cell(string Tipo, string Estado, DateOnly FechaDesde, DateOnly FechaHasta, string IdOcurrenciaPedido);
+
+    private record TipoVm(string Code, string Name, string Css, int Count);
+    #endregion
+
+    #region Navegación por Empleado en la tabla
+    private bool TieneLicenciaAnterior(Row empleado)
+    {
+        var result = empleado.Ranges.Any(r => IsTipoActivo(r.Tipo) && r.Desde < Start && r.Hasta >= Start);
+        return result;
+    }
+
+    private bool TieneLicenciaSiguiente(Row empleado)
+    {
+        var result = empleado.Ranges.Any(r => IsTipoActivo(r.Tipo) && r.Desde <= End && r.Hasta > End);
+        return result;
+    }
+
+    private async Task NavigateToEmployeeLicense(Row empleado, int direction)
+    {
+        var canGoPrev = direction < 0 && TieneLicenciaAnterior(empleado);
+        var canGoNext = direction > 0 && TieneLicenciaSiguiente(empleado);
+        if (!canGoPrev && !canGoNext) return;
+
+        var nextMonthStart = Start.AddMonths(direction < 0 ? -1 : 1);
+        year = nextMonthStart.Year;
+        month = nextMonthStart.Month;
+
+        await OnMonthYearChanged();
+    }
+    #endregion
+
+    #region CssDinamico por Tipo de Licencia
+    private readonly Dictionary<string, string> _codeToCss =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _codeToName =
+        new(StringComparer.OrdinalIgnoreCase);
+    private string _dynamicCss = "";
+
+    private static string Slug(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "t-otro";
+        var clean = new string(s.Where(char.IsLetterOrDigit).ToArray());
+        return "t-" + clean.ToLowerInvariant();
+    }
+
+    private static string PickTextColor(string hex)
+    {
+        int r = Convert.ToInt32(hex.Substring(1, 2), 16),
+            g = Convert.ToInt32(hex.Substring(3, 2), 16),
+            b = Convert.ToInt32(hex.Substring(5, 2), 16);
+        var yiq = ((r * 299) + (g * 587) + (b * 114)) / 1000;
+        return yiq >= 140 ? "#1f2937" : "#ffffff";
+    }
+
+    private void BuildDynamicCss(List<Sucesos> sucesos)
+    {
+        string[] palette = {
+            "#9d7dd1","#5dd5b8","#ff9f56","#DDF2FF","#EAF0FF",
+            "#FFE8F6","#E7F3FF","#F3E7FF","#EEF2F7","#FFEAF2",
+            "#8ecae6","#fb8500"
+        };
+
+        _codeToCss.Clear();
+        _codeToName.Clear();
+        var sb = new StringBuilder();
+        int i = 0;
+
+        foreach (var s in sucesos)
+        {
+            var code = (s.CodSuceso ?? "").Trim();
+            if (string.IsNullOrEmpty(code)) continue;
+
+            var css = Slug(code);
+            var name = (s.Descripcion ?? code).Trim();
+            var color = palette[i++ % palette.Length];
+            var text = PickTextColor(color);
+
+            _codeToCss[code] = css;
+            _codeToName[code] = name;
+
+            sb.AppendLine($".calendar-cell.{css}{{background:{color};}}");
+            sb.AppendLine($".legend.pill.{css}{{background:{color};border-color:{color};color:{text};}}");
+        }
+        _dynamicCss = sb.ToString();
+    }
+    #endregion
+}
